@@ -1,0 +1,6 @@
+{
+  "name": "AURA AI",
+  "description": "AURA AI - assistente personale per il benessere quotidiano.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
