@@ -38,6 +38,7 @@ import type {
 } from "../proactive/types";
 import { AutonomousIntelligencePanel } from "./AutonomousIntelligencePanel";
 import { CognitiveContinuitySection } from "./CognitiveContinuitySection";
+import { CognitiveEvolutionDashboard } from "./CognitiveEvolutionDashboard";
 import { UnifiedProactivePanel } from "./UnifiedProactivePanel";
 
 interface ProactiveDashboardProps {
@@ -550,6 +551,12 @@ export function ProactiveDashboard({
         availableMinutes={20}
         energyLevel="media"
         learningEngine={learningEngine}
+      />
+
+      <CognitiveEvolutionDashboard
+        aiMemoryConsent={consent}
+        crisisBlocked={crisisBlocked}
+        controlledLearning={learningEngine}
       />
     </section>
   );
