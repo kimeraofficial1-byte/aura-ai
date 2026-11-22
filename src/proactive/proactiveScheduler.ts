@@ -7,6 +7,54 @@ import type {
 } from "./types";
 
 const DEFAULT_MIN_INTERVAL_MS = 60_000;
+export const PROACTIVE_MODE_STORAGE_KEY = "aura_proactive_mode_v1";
+
+export function isValidProactiveMode(value: unknown): value is ProactiveMode {
+  return value === "PASSIVE" || value === "ASSISTED" || value === "USER-AUTHORIZED";
+}
+
+export interface MinimalStorageLike {
+  getItem(key: string): string | null;
+  setItem(key: string, value: string): void;
+}
+
+export function loadPersistedProactiveMode(
+  storage?: MinimalStorageLike | null
+): ProactiveMode {
+  try {
+    const target =
+      storage !== undefined
+        ? storage
+        : typeof window !== "undefined"
+          ? window.localStorage
+          : null;
+    if (!target) return "PASSIVE";
+    const raw = target.getItem(PROACTIVE_MODE_STORAGE_KEY);
+    return isValidProactiveMode(raw) ? raw : "PASSIVE";
+  } catch {
+    return "PASSIVE";
+  }
+}
+
+export function savePersistedProactiveMode(
+  mode: ProactiveMode,
+  storage?: MinimalStorageLike | null
+): boolean {
+  if (!isValidProactiveMode(mode)) return false;
+  try {
+    const target =
+      storage !== undefined
+        ? storage
+        : typeof window !== "undefined"
+          ? window.localStorage
+          : null;
+    if (!target) return false;
+    target.setItem(PROACTIVE_MODE_STORAGE_KEY, mode);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Scheduler controllato per Proactive Intelligence Engine V1.

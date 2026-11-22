@@ -108,10 +108,15 @@ export function rankCognitiveOpportunities(
       continue;
     }
 
-    // 3. Controllo cronologia precedente: sospesi, rifiutati o in cooldown
+    // 3. Controllo cronologia precedente: accettati, sospesi, rifiutati, completati o in cooldown
     const prev = prevByKey.get(item.dedupeKey);
     if (prev) {
-      if (prev.status === "suspended" || prev.status === "rejected" || prev.status === "completed") {
+      if (
+        prev.status === "accepted" ||
+        prev.status === "suspended" ||
+        prev.status === "rejected" ||
+        prev.status === "completed"
+      ) {
         skippedDuplicates += 1;
         continue;
       }

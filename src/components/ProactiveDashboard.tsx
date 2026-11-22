@@ -27,7 +27,11 @@ import {
   snoozeSuggestion,
   transitionSuggestionStatus,
 } from "../proactive/proactiveEngine";
-import { ProactiveScheduler } from "../proactive/proactiveScheduler";
+import {
+  loadPersistedProactiveMode,
+  ProactiveScheduler,
+  savePersistedProactiveMode,
+} from "../proactive/proactiveScheduler";
 import type {
   EpistemicTag,
   HabitPattern,
@@ -39,6 +43,7 @@ import type {
 import { AutonomousIntelligencePanel } from "./AutonomousIntelligencePanel";
 import { CognitiveContinuitySection } from "./CognitiveContinuitySection";
 import { CognitiveEvolutionDashboard } from "./CognitiveEvolutionDashboard";
+import { MetaCognitiveDashboard } from "./MetaCognitiveDashboard";
 import { UnifiedProactivePanel } from "./UnifiedProactivePanel";
 
 interface ProactiveDashboardProps {
@@ -73,10 +78,10 @@ export function ProactiveDashboard({
   consent,
   crisisBlocked,
 }: ProactiveDashboardProps) {
-  const scheduler = useMemo(() => new ProactiveScheduler({ mode: "PASSIVE" }), []);
+  const [mode, setMode] = useState<ProactiveMode>(() => loadPersistedProactiveMode());
+  const scheduler = useMemo(() => new ProactiveScheduler({ mode }), []);
   const learningEngine = useMemo(() => new ControlledLearningEngine(true), []);
 
-  const [mode, setMode] = useState<ProactiveMode>("PASSIVE");
   const [suspended, setSuspended] = useState(false);
   const [learningEnabled, setLearningEnabled] = useState(true);
   const [learningCount, setLearningCount] = useState(0);
@@ -90,13 +95,14 @@ export function ProactiveDashboard({
 
   function handleChangeMode(nextMode: ProactiveMode) {
     scheduler.setMode(nextMode);
+    savePersistedProactiveMode(nextMode);
     setMode(nextMode);
     setNotice(
       nextMode === "PASSIVE"
         ? "Modalità PASSIVE attiva: AURA analizza solo quando lo richiedi."
         : nextMode === "ASSISTED"
         ? "Modalità ASSISTED attiva: suggerimenti preparati solo all'apertura controllata dell'app."
-        : "Modalità USER-AUTHORIZED: le notifiche richiedono autorizzazione esplicita del browser."
+        : "Modalità USER-AUTHORIZED selezionata: eventuali azioni controllate richiedono comunque permesso granulare esplicito."
     );
   }
 
@@ -204,6 +210,19 @@ export function ProactiveDashboard({
         <p>
           Previsioni locali, schemi ricorrenti, proposte di priorità e suggerimenti contestuali — sempre sotto il tuo controllo, senza modifiche automatiche ai piani.
         </p>
+        <div className="aura-meta-jump-row">
+          <button
+            type="button"
+            className="aura-meta-btn"
+            onClick={() =>
+              document
+                .getElementById("aura-metacognitive-section")
+                ?.scrollIntoView({ behavior: "smooth", block: "start" })
+            }
+          >
+            Vai a Meta-Cognitive Intelligence V1
+          </button>
+        </div>
       </div>
 
       {crisisBlocked && (
@@ -225,17 +244,22 @@ export function ProactiveDashboard({
           <span className="panel-icon"><Bell size={19} /></span>
         </div>
 
-        <div style={{ display: "flex", flexWrap: "wrap", gap: "8px" }}>
-          {(["PASSIVE", "ASSISTED", "USER-AUTHORIZED"] as ProactiveMode[]).map((m) => (
-            <button
-              key={m}
-              type="button"
-              className={mode === m ? "mood selected" : "mood"}
-              onClick={() => handleChangeMode(m)}
-            >
-              {m}
-            </button>
-          ))}
+        <div className="aura-mode-group" role="group" aria-label="Modalità di autonomia proattiva">
+          {(["PASSIVE", "ASSISTED", "USER-AUTHORIZED"] as ProactiveMode[]).map((m) => {
+            const isSelected = mode === m;
+            return (
+              <button
+                key={m}
+                type="button"
+                className={`aura-mode-btn ${isSelected ? "is-selected" : ""}`}
+                aria-pressed={isSelected}
+                data-selected={isSelected ? "true" : "false"}
+                onClick={() => handleChangeMode(m)}
+              >
+                {m}
+              </button>
+            );
+          })}
         </div>
 
         <div style={{ display: "flex", flexWrap: "wrap", gap: "8px", alignItems: "center" }}>
@@ -528,6 +552,7 @@ export function ProactiveDashboard({
         consent={consent}
         crisisBlocked={crisisBlocked}
         learningEngine={learningEngine}
+        onDecisionRecorded={() => setLearningCount(learningEngine.getInteractionCount())}
       />
 
       <CognitiveContinuitySection
@@ -554,6 +579,15 @@ export function ProactiveDashboard({
       />
 
       <CognitiveEvolutionDashboard
+        aiMemoryConsent={consent}
+        crisisBlocked={crisisBlocked}
+        controlledLearning={learningEngine}
+      />
+
+      <MetaCognitiveDashboard
+        plans={plans}
+        missions={missions}
+        growthGoals={growthGoals}
         aiMemoryConsent={consent}
         crisisBlocked={crisisBlocked}
         controlledLearning={learningEngine}
