@@ -97,7 +97,7 @@ export function buildAuraSystemInstruction(
       message,
       history,
       context,
-      consentEnabled: Boolean(context?.memorySummary || context?.orchestratedContextSummary),
+      consentEnabled: false,
     });
     const reasoningGuidance = buildReasoningGuidanceForGemini(reasoning);
     if (reasoningGuidance) {

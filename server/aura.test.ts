@@ -1,5 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   CRISIS_EMERGENCY_REPLY,
   evaluatePreModelSafety,
@@ -10,6 +13,7 @@ import {
   buildGeminiContents,
   mapGeminiError,
 } from "./auraAgent";
+import { runStructuredReasoning } from "../src/reasoning/reasoningEngine";
 
 test("evaluatePreModelSafety detects crisis keywords and preserves emergency guidance", () => {
   const res1 = evaluatePreModelSafety("Non voglio più vivere, voglio farla finita");
@@ -118,3 +122,89 @@ test("mapGeminiError maps auth, quota, model-not-found, and timeout errors clean
     "MODEL_NOT_FOUND"
   );
 });
+
+test("server/auraAgent.ts forces fail-closed consentEnabled: false and never deduces consent from context summaries", () => {
+  const currentDir = path.dirname(fileURLToPath(import.meta.url));
+  const agentSource = readFileSync(path.join(currentDir, "auraAgent.ts"), "utf8");
+
+  const reasoningCallMatch = agentSource.match(
+    /runStructuredReasoning\(\{[\s\S]*?\}\);/
+  );
+  assert.ok(
+    reasoningCallMatch,
+    "Expected runStructuredReasoning call in server/auraAgent.ts"
+  );
+  assert.match(reasoningCallMatch[0], /\bconsentEnabled:\s*false\b/);
+  assert.doesNotMatch(
+    reasoningCallMatch[0],
+    /Boolean\(context\?\.memorySummary|context\?\.orchestratedContextSummary/
+  );
+
+  const reasoning = runStructuredReasoning({
+    message: "Mi sento sopraffatto dal lavoro oggi",
+    context: {
+      mood: "Teso",
+      stress: 8,
+      memorySummary: "Ricordo testuale presente nel payload.",
+      orchestratedContextSummary: "CONTESTO ORCHESTRATO PRESENTE NEL PAYLOAD.",
+    },
+    consentEnabled: false,
+  });
+
+  assert.ok(
+    reasoning.facts.includes(
+      "Memoria persistente disattivata: utilizzo solo il contesto della sessione corrente."
+    )
+  );
+  assert.ok(
+    !reasoning.facts.includes(
+      "Contesto personale autorizzato disponibile tramite Context Engine V2."
+    )
+  );
+});
+
+test("buildAuraSystemInstruction continues forwarding conversational context and reasoning guidance without payload consent deduction", () => {
+  const orchestratedText =
+    "CONTESTO PERSONALE AUTORIZZATO (test 11.2.4): preferisce pause brevi di respirazione.";
+  const withOrchestrated = buildAuraSystemInstruction(
+    {
+      mood: "Affaticato",
+      stress: 7,
+      memorySummary: "Fallback summary non prioritario",
+      orchestratedContextSummary: orchestratedText,
+    },
+    "Aiutami a fare una pausa breve di 5 minuti",
+    [{ role: "user", text: "Ciao AURA" }]
+  );
+
+  assert.match(withOrchestrated, /CONTESTO PERSONALE AUTORIZZATO \(test 11\.2\.4\)/);
+  assert.match(withOrchestrated, /GUIDA DI RAGIONAMENTO STRUTTURATO/);
+
+  const withMemoryOnly = buildAuraSystemInstruction(
+    {
+      mood: "Calmo",
+      stress: 3,
+      memorySummary: "Preferisce camminate pomeridiane.",
+    },
+    "Come posso organizzare la serata?"
+  );
+
+  assert.match(withMemoryOnly, /MEMORIA VERIFICATA/);
+  assert.match(withMemoryOnly, /Preferisce camminate pomeridiane/);
+  assert.match(withMemoryOnly, /GUIDA DI RAGIONAMENTO STRUTTURATO/);
+
+  const req = validateChatRequest({
+    message: "Ciao AURA",
+    context: {
+      mood: "Sereno",
+      stress: 2,
+      orchestratedContextSummary: orchestratedText,
+    },
+  });
+  assert.equal(req.ok, true);
+  if (req.ok) {
+    assert.equal(req.data.context?.orchestratedContextSummary, orchestratedText);
+    assert.equal("consentEnabled" in (req.data.context ?? {}), false);
+  }
+});
+
