@@ -13,6 +13,10 @@ import type {
 
 export const DEFAULT_AURA_MODEL = "gemini-4-hydrogen";
 export const FALLBACK_AURA_MODEL = "gemini-3.1-flash-lite";
+export const RETRY_BASE_DELAY_MS = 1_200;
+export const RETRY_MAX_DELAY_MS = 8_000;
+export const RETRY_JITTER_RATIO = 0.25;
+export const MAX_STREAM_ATTEMPTS = 3;
 const IDLE_TIMEOUT_MS = 90_000;
 const PRIMARY_FIRST_CHUNK_TIMEOUT_MS = 35_000;
 
@@ -257,6 +261,68 @@ export class AuraTimeoutError extends Error {
   }
 }
 
+export class AuraAbortError extends Error {
+  constructor(message = "Gemini request aborted") {
+    super(message);
+    this.name = "AbortError";
+  }
+}
+
+export function isAbortError(error: unknown, signal?: AbortSignal): boolean {
+  if (signal?.aborted) return true;
+  if (error instanceof AuraAbortError) return true;
+  if (error instanceof Error && error.name === "AbortError") return true;
+  return false;
+}
+
+export function waitWithAbort(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) {
+    return Promise.reject(new AuraAbortError());
+  }
+  if (ms <= 0) {
+    return Promise.resolve();
+  }
+
+  return new Promise<void>((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      reject(new AuraAbortError());
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+export function computeRetryDelayMs(
+  retryIndex: number,
+  options?: {
+    baseDelayMs?: number;
+    maxDelayMs?: number;
+    jitterRatio?: number;
+    randomFn?: () => number;
+  }
+): number {
+  const safeIndex = Math.max(0, Math.floor(retryIndex));
+  const baseDelayMs = Math.max(0, options?.baseDelayMs ?? RETRY_BASE_DELAY_MS);
+  const maxDelayMs = Math.max(baseDelayMs, options?.maxDelayMs ?? RETRY_MAX_DELAY_MS);
+  const jitterRatio = Math.max(0, Math.min(1, options?.jitterRatio ?? RETRY_JITTER_RATIO));
+  const randomFn = options?.randomFn ?? Math.random;
+
+  const exponential = Math.min(maxDelayMs, baseDelayMs * 2 ** safeIndex);
+  const rawRand = Number(randomFn());
+  const clampedRand = Number.isFinite(rawRand) ? Math.max(0, Math.min(1, rawRand)) : 0.5;
+  const jitter = Math.round(exponential * jitterRatio * clampedRand);
+  return Math.min(maxDelayMs, exponential + jitter);
+}
+
+export function isRetryableGeminiStreamError(mapped: MappedGeminiError): boolean {
+  return mapped.code === "RATE_LIMIT" || mapped.retryable;
+}
+
 export interface GenerateAuraStreamParams {
   apiKey: string;
   message: string;
@@ -265,13 +331,23 @@ export interface GenerateAuraStreamParams {
   timeoutMs?: number;
   signal?: AbortSignal;
   onChunk?: (chunkText: string, accumulatedText: string) => void;
+  clientOverride?: Pick<GoogleGenAI, "models">;
+  primaryModelOverride?: string;
+  retryBaseDelayMs?: number;
+  retryMaxDelayMs?: number;
+  randomFn?: () => number;
+  sleepFn?: (ms: number, signal?: AbortSignal) => Promise<void>;
 }
 
 export async function generateAuraReplyStream(
   params: GenerateAuraStreamParams
 ): Promise<{ reply: string; model: string }> {
-  const primaryModel = getAuraModelName();
-  const ai = createGeminiClient(params.apiKey);
+  if (params.signal?.aborted) {
+    throw new AuraAbortError();
+  }
+
+  const primaryModel = params.primaryModelOverride?.trim() || getAuraModelName();
+  const ai = params.clientOverride ?? createGeminiClient(params.apiKey);
   const systemInstruction = buildAuraSystemInstruction(
     params.context,
     params.message,
@@ -280,12 +356,17 @@ export async function generateAuraReplyStream(
   const contents = buildGeminiContents(params.message, params.history);
   const idleTimeoutMs = params.timeoutMs ?? IDLE_TIMEOUT_MS;
   const canFallback = primaryModel !== FALLBACK_AURA_MODEL;
+  const sleep = params.sleepFn ?? waitWithAbort;
 
   const attemptCall = async (
     targetModel: string,
     firstChunkTimeoutMs: number,
     onChunkCb?: (chunkText: string, accumulatedText: string) => void
   ): Promise<{ reply: string; model: string }> => {
+    if (params.signal?.aborted) {
+      throw new AuraAbortError();
+    }
+
     const controller = new AbortController();
     let timedOut = false;
     let idleTimer: ReturnType<typeof setTimeout> | undefined;
@@ -339,6 +420,9 @@ export async function generateAuraReplyStream(
       });
 
       for await (const chunk of stream) {
+        if (params.signal?.aborted) {
+          throw new AuraAbortError();
+        }
         armTimer(idleTimeoutMs);
         const chunkText = chunk.text ?? "";
         if (chunkText) {
@@ -353,6 +437,9 @@ export async function generateAuraReplyStream(
       }
       return { reply, model: targetModel };
     } catch (err) {
+      if (params.signal?.aborted) {
+        throw err instanceof Error ? err : new AuraAbortError();
+      }
       if (timedOut) {
         throw new AuraTimeoutError(firstChunkTimeoutMs);
       }
@@ -372,60 +459,65 @@ export async function generateAuraReplyStream(
       }
     : undefined;
 
-  const primaryFirstChunkTimeout = canFallback
-    ? Math.min(idleTimeoutMs, PRIMARY_FIRST_CHUNK_TIMEOUT_MS)
-    : idleTimeoutMs;
+  let currentModel = primaryModel;
+  let retryCount = 0;
 
-  try {
-    return await attemptCall(primaryModel, primaryFirstChunkTimeout, trackedOnChunk);
-  } catch (firstError) {
-    if (params.signal?.aborted || emittedAnyChunk) {
-      throw firstError;
+  for (let attempt = 0; attempt < MAX_STREAM_ATTEMPTS; attempt += 1) {
+    if (params.signal?.aborted) {
+      throw new AuraAbortError();
     }
 
-    const mapped = mapGeminiError(firstError);
-    const isRateLimit = mapped.code === "RATE_LIMIT";
-    const shouldFallback =
-      canFallback &&
-      (mapped.retryable ||
-        isRateLimit ||
-        mapped.code === "TIMEOUT" ||
-        mapped.code === "MODEL_NOT_FOUND" ||
-        mapped.code === "UPSTREAM_ERROR");
+    const firstChunkTimeout =
+      attempt === 0 && canFallback
+        ? Math.min(idleTimeoutMs, PRIMARY_FIRST_CHUNK_TIMEOUT_MS)
+        : idleTimeoutMs;
 
-    if (shouldFallback) {
-      if (isRateLimit) {
-        await new Promise((resolve) => setTimeout(resolve, 1_500));
-        if (params.signal?.aborted) {
-          throw firstError;
-        }
+    try {
+      return await attemptCall(currentModel, firstChunkTimeout, trackedOnChunk);
+    } catch (error) {
+      if (isAbortError(error, params.signal) || emittedAnyChunk) {
+        throw error;
       }
-      try {
-        return await attemptCall(FALLBACK_AURA_MODEL, idleTimeoutMs, trackedOnChunk);
-      } catch (fallbackError) {
-        if (params.signal?.aborted || emittedAnyChunk) {
-          throw fallbackError;
-        }
-        const secondMapped = mapGeminiError(fallbackError);
-        const delayMs = secondMapped.code === "RATE_LIMIT" ? 2_500 : 700;
-        await new Promise((resolve) => setTimeout(resolve, delayMs));
-        if (params.signal?.aborted) {
-          throw fallbackError;
-        }
-        return await attemptCall("gemini-4-carbon", idleTimeoutMs, trackedOnChunk);
+
+      const mapped = mapGeminiError(error);
+      const isLastAttempt = attempt >= MAX_STREAM_ATTEMPTS - 1;
+      if (isLastAttempt) {
+        throw error;
+      }
+
+      if (mapped.code === "INVALID_API_KEY" || mapped.code === "INVALID_REQUEST") {
+        throw error;
+      }
+
+      const canRetryWithBackoff = isRetryableGeminiStreamError(mapped);
+      const canSwitchToFallback =
+        canFallback &&
+        currentModel !== FALLBACK_AURA_MODEL &&
+        (canRetryWithBackoff ||
+          mapped.code === "TIMEOUT" ||
+          mapped.code === "MODEL_NOT_FOUND");
+
+      if (!canRetryWithBackoff && !canSwitchToFallback) {
+        throw error;
+      }
+
+      if (canFallback && currentModel !== FALLBACK_AURA_MODEL) {
+        currentModel = FALLBACK_AURA_MODEL;
+      }
+
+      if (canRetryWithBackoff) {
+        const delayMs = computeRetryDelayMs(retryCount, {
+          baseDelayMs: params.retryBaseDelayMs,
+          maxDelayMs: params.retryMaxDelayMs,
+          randomFn: params.randomFn,
+        });
+        retryCount += 1;
+        await sleep(delayMs, params.signal);
       }
     }
-
-    if (mapped.retryable || isRateLimit || mapped.code === "UPSTREAM_ERROR") {
-      await new Promise((resolve) => setTimeout(resolve, isRateLimit ? 1_500 : 600));
-      if (params.signal?.aborted) {
-        throw firstError;
-      }
-      return await attemptCall(primaryModel, idleTimeoutMs, trackedOnChunk);
-    }
-
-    throw firstError;
   }
+
+  throw new Error("Exhausted Gemini stream attempts");
 }
 
 export async function generateAuraReply(params: {

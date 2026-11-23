@@ -9,11 +9,25 @@ import {
   validateChatRequest,
 } from "./safety";
 import {
+  AuraAbortError,
   buildAuraSystemInstruction,
   buildGeminiContents,
+  computeRetryDelayMs,
+  DEFAULT_AURA_MODEL,
+  FALLBACK_AURA_MODEL,
+  generateAuraReplyStream,
   mapGeminiError,
+  MAX_STREAM_ATTEMPTS,
+  RETRY_BASE_DELAY_MS,
+  RETRY_MAX_DELAY_MS,
+  waitWithAbort,
 } from "./auraAgent";
 import { runStructuredReasoning } from "../src/reasoning/reasoningEngine";
+import {
+  AuraClientError,
+  resolveAuraErrorStatus,
+  sendAuraChatMessage,
+} from "../src/services/auraClient";
 
 test("evaluatePreModelSafety detects crisis keywords and preserves emergency guidance", () => {
   const res1 = evaluatePreModelSafety("Non voglio più vivere, voglio farla finita");
@@ -207,4 +221,282 @@ test("buildAuraSystemInstruction continues forwarding conversational context and
     assert.equal("consentEnabled" in (req.data.context ?? {}), false);
   }
 });
+
+test("server/auraAgent.ts contains zero operational references to gemini-4-carbon and only calls authorized models", async () => {
+  const currentDir = path.dirname(fileURLToPath(import.meta.url));
+  const agentSource = readFileSync(path.join(currentDir, "auraAgent.ts"), "utf8");
+  assert.doesNotMatch(agentSource, /gemini-4-carbon/);
+
+  const calledModels: string[] = [];
+  const recordedDelays: number[] = [];
+
+  const result = await generateAuraReplyStream({
+    apiKey: "test-key",
+    message: "Mi sento un po' teso oggi",
+    primaryModelOverride: DEFAULT_AURA_MODEL,
+    retryBaseDelayMs: 100,
+    retryMaxDelayMs: 500,
+    randomFn: () => 0.5,
+    sleepFn: async (ms) => {
+      recordedDelays.push(ms);
+    },
+    clientOverride: {
+      models: {
+        generateContentStream: (async (req: { model: string }) => {
+          calledModels.push(req.model);
+          if (req.model === DEFAULT_AURA_MODEL) {
+            throw Object.assign(new Error("RESOURCE_EXHAUSTED"), { status: 429 });
+          }
+          async function* chunks() {
+            yield { text: "Ciao, ti ascolto con calma." };
+          }
+          return chunks();
+        }) as unknown as Parameters<typeof generateAuraReplyStream>[0]["clientOverride"] extends infer C
+          ? C extends { models: { generateContentStream: infer F } }
+            ? F
+            : never
+          : never,
+      },
+    } as NonNullable<Parameters<typeof generateAuraReplyStream>[0]["clientOverride"]>,
+  });
+
+  assert.equal(result.model, FALLBACK_AURA_MODEL);
+  assert.equal(result.reply, "Ciao, ti ascolto con calma.");
+  assert.deepEqual(calledModels, [DEFAULT_AURA_MODEL, FALLBACK_AURA_MODEL]);
+  assert.equal(calledModels.includes("gemini-4-carbon"), false);
+  assert.equal(recordedDelays.length, 1);
+});
+
+test("exponential backoff with jitter respects bounds and stops after MAX_STREAM_ATTEMPTS propagating RATE_LIMIT", async () => {
+  const d0 = computeRetryDelayMs(0, { randomFn: () => 0 });
+  const d0Max = computeRetryDelayMs(0, { randomFn: () => 1 });
+  const d1 = computeRetryDelayMs(1, { randomFn: () => 0 });
+  const dCapped = computeRetryDelayMs(10, { randomFn: () => 1 });
+
+  assert.equal(d0, RETRY_BASE_DELAY_MS);
+  assert.ok(d0Max > d0);
+  assert.ok(d1 > d0Max);
+  assert.equal(dCapped, RETRY_MAX_DELAY_MS);
+
+  const calledModels: string[] = [];
+  const recordedDelays: number[] = [];
+
+  await assert.rejects(
+    async () =>
+      generateAuraReplyStream({
+        apiKey: "test-key",
+        message: "Aiutami a fare ordine nei pensieri",
+        primaryModelOverride: DEFAULT_AURA_MODEL,
+        retryBaseDelayMs: 100,
+        retryMaxDelayMs: 350,
+        randomFn: () => 0.4,
+        sleepFn: async (ms) => {
+          recordedDelays.push(ms);
+        },
+        clientOverride: {
+          models: {
+            generateContentStream: (async (req: { model: string }) => {
+              calledModels.push(req.model);
+              throw Object.assign(new Error("429 RESOURCE_EXHAUSTED"), { status: 429 });
+            }) as never,
+          },
+        },
+      }),
+    (err: unknown) => {
+      const mapped = mapGeminiError(err);
+      assert.equal(mapped.code, "RATE_LIMIT");
+      assert.equal(mapped.status, 429);
+      return true;
+    }
+  );
+
+  assert.equal(calledModels.length, MAX_STREAM_ATTEMPTS);
+  assert.deepEqual(calledModels, [
+    DEFAULT_AURA_MODEL,
+    FALLBACK_AURA_MODEL,
+    FALLBACK_AURA_MODEL,
+  ]);
+  assert.equal(recordedDelays.length, MAX_STREAM_ATTEMPTS - 1);
+  assert.ok(recordedDelays[0] >= 100 && recordedDelays[0] <= 350);
+  assert.ok(recordedDelays[1] > recordedDelays[0] && recordedDelays[1] <= 350);
+});
+
+test("waitWithAbort and retry waits abort immediately via AbortSignal without residual delay", async () => {
+  const controller = new AbortController();
+  const startedAt = Date.now();
+  setTimeout(() => controller.abort(), 20);
+
+  await assert.rejects(
+    async () => waitWithAbort(5_000, controller.signal),
+    (err: unknown) => err instanceof AuraAbortError || (err instanceof Error && err.name === "AbortError")
+  );
+  const elapsed = Date.now() - startedAt;
+  assert.ok(elapsed < 500, `Expected immediate abort under 500ms, got ${elapsed}ms`);
+
+  const streamController = new AbortController();
+  const calledModels: string[] = [];
+  const streamStart = Date.now();
+
+  await assert.rejects(
+    async () =>
+      generateAuraReplyStream({
+        apiKey: "test-key",
+        message: "Test interruzione retry",
+        signal: streamController.signal,
+        primaryModelOverride: DEFAULT_AURA_MODEL,
+        retryBaseDelayMs: 5_000,
+        retryMaxDelayMs: 5_000,
+        clientOverride: {
+          models: {
+            generateContentStream: (async (req: { model: string }) => {
+              calledModels.push(req.model);
+              setTimeout(() => streamController.abort(), 15);
+              throw Object.assign(new Error("RESOURCE_EXHAUSTED"), { status: 429 });
+            }) as never,
+          },
+        },
+      }),
+    (err: unknown) => err instanceof Error && err.name === "AbortError"
+  );
+
+  const streamElapsed = Date.now() - streamStart;
+  assert.deepEqual(calledModels, [DEFAULT_AURA_MODEL]);
+  assert.ok(streamElapsed < 500, `Expected retry abort under 500ms, got ${streamElapsed}ms`);
+});
+
+test("generateAuraReplyStream does not retry after emitting first chunk or on INVALID_API_KEY", async () => {
+  const chunkCalls: string[] = [];
+  let sleepCallsAfterChunk = 0;
+
+  await assert.rejects(
+    async () =>
+      generateAuraReplyStream({
+        apiKey: "test-key",
+        message: "Ciao",
+        primaryModelOverride: DEFAULT_AURA_MODEL,
+        sleepFn: async () => {
+          sleepCallsAfterChunk += 1;
+        },
+        onChunk: () => {},
+        clientOverride: {
+          models: {
+            generateContentStream: (async (req: { model: string }) => {
+              chunkCalls.push(req.model);
+              async function* partialStream() {
+                yield { text: "Primo chunk" };
+                throw Object.assign(new Error("RESOURCE_EXHAUSTED"), { status: 429 });
+              }
+              return partialStream();
+            }) as never,
+          },
+        },
+      }),
+    (err: unknown) => mapGeminiError(err).code === "RATE_LIMIT"
+  );
+
+  assert.deepEqual(chunkCalls, [DEFAULT_AURA_MODEL]);
+  assert.equal(sleepCallsAfterChunk, 0);
+
+  const authCalls: string[] = [];
+  let sleepCallsOnAuth = 0;
+
+  await assert.rejects(
+    async () =>
+      generateAuraReplyStream({
+        apiKey: "bad-key",
+        message: "Ciao",
+        primaryModelOverride: DEFAULT_AURA_MODEL,
+        sleepFn: async () => {
+          sleepCallsOnAuth += 1;
+        },
+        clientOverride: {
+          models: {
+            generateContentStream: (async (req: { model: string }) => {
+              authCalls.push(req.model);
+              throw Object.assign(new Error("API_KEY_INVALID"), { status: 401 });
+            }) as never,
+          },
+        },
+      }),
+    (err: unknown) => mapGeminiError(err).code === "INVALID_API_KEY"
+  );
+
+  assert.deepEqual(authCalls, [DEFAULT_AURA_MODEL]);
+  assert.equal(sleepCallsOnAuth, 0);
+});
+
+test("SSE client propagates status 429 for RATE_LIMIT, preserves explicit status, and cancels reader only on premature error", async () => {
+  assert.equal(resolveAuraErrorStatus("RATE_LIMIT", undefined, 502), 429);
+  assert.equal(resolveAuraErrorStatus("RATE_LIMIT", 503, 502), 503);
+  assert.equal(resolveAuraErrorStatus("UPSTREAM_ERROR", undefined, 502), 502);
+
+  const originalFetch = globalThis.fetch;
+  try {
+    let cancelCallsOnError = 0;
+    globalThis.fetch = (async () => {
+      let sent = false;
+      const body = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          if (!sent) {
+            sent = true;
+            controller.enqueue(
+              new TextEncoder().encode(
+                'event: error\ndata: {"error":"Limite richieste raggiunto","code":"RATE_LIMIT"}\n\n'
+              )
+            );
+          }
+        },
+        cancel() {
+          cancelCallsOnError += 1;
+          return Promise.reject(new Error("cleanup error must not mask RATE_LIMIT"));
+        },
+      });
+      return new Response(body, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream; charset=utf-8" },
+      });
+    }) as typeof fetch;
+
+    await assert.rejects(
+      async () => sendAuraChatMessage({ message: "Ciao AURA" }),
+      (err: unknown) => {
+        assert.ok(err instanceof AuraClientError);
+        assert.equal(err.code, "RATE_LIMIT");
+        assert.equal(err.status, 429);
+        assert.equal(err.message, "Limite richieste raggiunto");
+        return true;
+      }
+    );
+    assert.equal(cancelCallsOnError, 1);
+
+    let cancelCallsOnDone = 0;
+    globalThis.fetch = (async () => {
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(
+            new TextEncoder().encode(
+              'event: chunk\ndata: {"chunk":"Ciao","accumulated":"Ciao"}\n\n' +
+                'event: done\ndata: {"reply":"Ciao, sono qui.","crisisDetected":false,"meta":{"model":"gemini-4-hydrogen","source":"gemini","latencyMs":12}}\n\n'
+            )
+          );
+          controller.close();
+        },
+        cancel() {
+          cancelCallsOnDone += 1;
+        },
+      });
+      return new Response(body, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream; charset=utf-8" },
+      });
+    }) as typeof fetch;
+
+    const okRes = await sendAuraChatMessage({ message: "Ciao AURA" });
+    assert.equal(okRes.reply, "Ciao, sono qui.");
+    assert.equal(cancelCallsOnDone, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 

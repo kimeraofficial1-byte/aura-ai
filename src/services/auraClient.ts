@@ -33,6 +33,36 @@ export interface SendAuraChatOptions {
   onAnalysis?: (analysis: EmotionalAnalysis) => void;
 }
 
+export function resolveAuraErrorStatus(
+  code: AuraErrorCode | "NETWORK_ERROR" | undefined,
+  explicitStatus?: unknown,
+  fallbackStatus = 502
+): number {
+  if (
+    typeof explicitStatus === "number" &&
+    Number.isInteger(explicitStatus) &&
+    explicitStatus >= 400 &&
+    explicitStatus <= 599
+  ) {
+    return explicitStatus;
+  }
+  switch (code) {
+    case "INVALID_REQUEST":
+      return 400;
+    case "RATE_LIMIT":
+      return 429;
+    case "MISSING_API_KEY":
+      return 503;
+    case "TIMEOUT":
+      return 504;
+    case "INVALID_API_KEY":
+    case "MODEL_NOT_FOUND":
+    case "UPSTREAM_ERROR":
+    default:
+      return fallbackStatus;
+  }
+}
+
 export async function sendAuraChatMessage(
   payload: AuraChatRequest,
   options?: SendAuraChatOptions
@@ -58,6 +88,7 @@ export async function sendAuraChatMessage(
       const decoder = new TextDecoder();
       let buffer = "";
       let finalPayload: AuraChatResponse | null = null;
+      let streamDone = false;
 
       type ParsedSseEvent =
         | { type: "analysis"; analysis: EmotionalAnalysis }
@@ -93,48 +124,59 @@ export async function sendAuraChatMessage(
           return { type: "done", payload: parsed as unknown as AuraChatResponse };
         }
         if (eventName === "error") {
-          const errData = parsed as Partial<AuraErrorResponse>;
+          const errData = parsed as Partial<AuraErrorResponse> & { status?: unknown };
+          const code = errData.code || "UPSTREAM_ERROR";
+          const status = resolveAuraErrorStatus(code, errData.status, 502);
           throw new AuraClientError(
             errData.error ||
               "Non è stato possibile ottenere una risposta da AURA AI. Riprova tra poco.",
-            502,
-            errData.code || "UPSTREAM_ERROR"
+            status,
+            code
           );
         }
         return null;
       };
 
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
-
-        let boundaryIndex = buffer.indexOf("\n\n");
-        while (boundaryIndex !== -1) {
-          const eventBlock = buffer.slice(0, boundaryIndex);
-          buffer = buffer.slice(boundaryIndex + 2);
-          if (eventBlock.trim()) {
-            const evt = parseSseEventBlock(eventBlock);
-            if (evt?.type === "analysis") {
-              options?.onAnalysis?.(evt.analysis);
-            } else if (evt?.type === "chunk") {
-              options?.onChunk?.(evt.accumulated);
-            } else if (evt?.type === "done") {
-              finalPayload = evt.payload;
-            }
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) {
+            streamDone = true;
+            break;
           }
-          boundaryIndex = buffer.indexOf("\n\n");
-        }
-      }
+          buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
 
-      if (buffer.trim()) {
-        const evt = parseSseEventBlock(buffer);
-        if (evt?.type === "analysis") {
-          options?.onAnalysis?.(evt.analysis);
-        } else if (evt?.type === "chunk") {
-          options?.onChunk?.(evt.accumulated);
-        } else if (evt?.type === "done") {
-          finalPayload = evt.payload;
+          let boundaryIndex = buffer.indexOf("\n\n");
+          while (boundaryIndex !== -1) {
+            const eventBlock = buffer.slice(0, boundaryIndex);
+            buffer = buffer.slice(boundaryIndex + 2);
+            if (eventBlock.trim()) {
+              const evt = parseSseEventBlock(eventBlock);
+              if (evt?.type === "analysis") {
+                options?.onAnalysis?.(evt.analysis);
+              } else if (evt?.type === "chunk") {
+                options?.onChunk?.(evt.accumulated);
+              } else if (evt?.type === "done") {
+                finalPayload = evt.payload;
+              }
+            }
+            boundaryIndex = buffer.indexOf("\n\n");
+          }
+        }
+
+        if (buffer.trim()) {
+          const evt = parseSseEventBlock(buffer);
+          if (evt?.type === "analysis") {
+            options?.onAnalysis?.(evt.analysis);
+          } else if (evt?.type === "chunk") {
+            options?.onChunk?.(evt.accumulated);
+          } else if (evt?.type === "done") {
+            finalPayload = evt.payload;
+          }
+        }
+      } finally {
+        if (!streamDone) {
+          await reader.cancel().catch(() => {});
         }
       }
 
@@ -153,12 +195,18 @@ export async function sendAuraChatMessage(
     const data = isJson ? await response.json() : null;
 
     if (!response.ok) {
-      const errData = (data ?? {}) as Partial<AuraErrorResponse>;
+      const errData = (data ?? {}) as Partial<AuraErrorResponse> & { status?: unknown };
+      const code = errData.code || "UPSTREAM_ERROR";
+      const status = resolveAuraErrorStatus(
+        code,
+        errData.status ?? response.status,
+        response.status || 502
+      );
       throw new AuraClientError(
         errData.error ||
           "Non è stato possibile ottenere una risposta da AURA AI. Riprova tra poco.",
-        response.status,
-        errData.code || "UPSTREAM_ERROR"
+        status,
+        code
       );
     }
 

@@ -603,7 +603,11 @@ export default function App() {
       }
       setChatError(errMsg);
       setLastFailedMessage(cleanMessage);
-      setStatus("ERRORE CONNESSIONE AI");
+      setStatus(
+        error instanceof AuraClientError && error.code === "RATE_LIMIT"
+          ? "LIMITE RICHIESTE AI"
+          : "ERRORE CONNESSIONE AI"
+      );
     } finally {
       setBusy(false);
     }
