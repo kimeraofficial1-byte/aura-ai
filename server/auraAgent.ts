@@ -268,6 +268,25 @@ export class AuraAbortError extends Error {
   }
 }
 
+export class AuraEmptyResponseError extends Error {
+  constructor(message = "Empty response from Gemini model") {
+    super(message);
+    this.name = "AuraEmptyResponseError";
+  }
+}
+
+export function isEmptyGeminiResponseError(error: unknown): boolean {
+  if (error instanceof AuraEmptyResponseError) return true;
+  if (
+    error instanceof Error &&
+    (error.name === "AuraEmptyResponseError" ||
+      error.message === "Empty response from Gemini model")
+  ) {
+    return true;
+  }
+  return false;
+}
+
 export function isAbortError(error: unknown, signal?: AbortSignal): boolean {
   if (signal?.aborted) return true;
   if (error instanceof AuraAbortError) return true;
@@ -323,6 +342,30 @@ export function isRetryableGeminiStreamError(mapped: MappedGeminiError): boolean
   return mapped.code === "RATE_LIMIT" || mapped.retryable;
 }
 
+export interface StreamAttemptDiagnostic {
+  attempt: number;
+  maxAttempts: number;
+  model: string;
+  mappedCode: AuraErrorCode | "ABORTED";
+  httpStatus: number | null;
+  errName: string;
+  emittedAnyChunk: boolean;
+  willSwitchToFallback: boolean;
+  willRetry: boolean;
+}
+
+function extractNumericHttpStatus(error: unknown): number | null {
+  if (!error || typeof error !== "object") return null;
+  const errObj = error as Record<string, unknown>;
+  if (typeof errObj.status === "number" && Number.isFinite(errObj.status)) {
+    return errObj.status;
+  }
+  if (typeof errObj.code === "number" && Number.isFinite(errObj.code)) {
+    return errObj.code;
+  }
+  return null;
+}
+
 export interface GenerateAuraStreamParams {
   apiKey: string;
   message: string;
@@ -331,6 +374,7 @@ export interface GenerateAuraStreamParams {
   timeoutMs?: number;
   signal?: AbortSignal;
   onChunk?: (chunkText: string, accumulatedText: string) => void;
+  onAttemptDiagnostic?: (diagnostic: StreamAttemptDiagnostic) => void;
   clientOverride?: Pick<GoogleGenAI, "models">;
   primaryModelOverride?: string;
   retryBaseDelayMs?: number;
@@ -433,7 +477,7 @@ export async function generateAuraReplyStream(
 
       const reply = accumulated.trim();
       if (!reply) {
-        throw new Error("Empty response from Gemini model");
+        throw new AuraEmptyResponseError();
       }
       return { reply, model: targetModel };
     } catch (err) {
@@ -459,6 +503,11 @@ export async function generateAuraReplyStream(
       }
     : undefined;
 
+  const emitDiagnostic = (diagnostic: StreamAttemptDiagnostic) => {
+    console.warn("[AURA /api/chat] Gemini stream attempt failed:", diagnostic);
+    params.onAttemptDiagnostic?.(diagnostic);
+  };
+
   let currentModel = primaryModel;
   let retryCount = 0;
 
@@ -475,37 +524,95 @@ export async function generateAuraReplyStream(
     try {
       return await attemptCall(currentModel, firstChunkTimeout, trackedOnChunk);
     } catch (error) {
-      if (isAbortError(error, params.signal) || emittedAnyChunk) {
+      const errName = error instanceof Error ? error.name : typeof error;
+      const httpStatus = extractNumericHttpStatus(error);
+      const aborted = isAbortError(error, params.signal);
+
+      if (aborted) {
+        emitDiagnostic({
+          attempt: attempt + 1,
+          maxAttempts: MAX_STREAM_ATTEMPTS,
+          model: currentModel,
+          mappedCode: "ABORTED",
+          httpStatus,
+          errName,
+          emittedAnyChunk,
+          willSwitchToFallback: false,
+          willRetry: false,
+        });
         throw error;
       }
 
       const mapped = mapGeminiError(error);
+
+      if (emittedAnyChunk) {
+        emitDiagnostic({
+          attempt: attempt + 1,
+          maxAttempts: MAX_STREAM_ATTEMPTS,
+          model: currentModel,
+          mappedCode: mapped.code,
+          httpStatus,
+          errName,
+          emittedAnyChunk,
+          willSwitchToFallback: false,
+          willRetry: false,
+        });
+        throw error;
+      }
+
       const isLastAttempt = attempt >= MAX_STREAM_ATTEMPTS - 1;
-      if (isLastAttempt) {
+      const isNonRetryableClientError =
+        mapped.code === "INVALID_API_KEY" || mapped.code === "INVALID_REQUEST";
+
+      if (isLastAttempt || isNonRetryableClientError) {
+        emitDiagnostic({
+          attempt: attempt + 1,
+          maxAttempts: MAX_STREAM_ATTEMPTS,
+          model: currentModel,
+          mappedCode: mapped.code,
+          httpStatus,
+          errName,
+          emittedAnyChunk,
+          willSwitchToFallback: false,
+          willRetry: false,
+        });
         throw error;
       }
 
-      if (mapped.code === "INVALID_API_KEY" || mapped.code === "INVALID_REQUEST") {
-        throw error;
-      }
-
+      const isEmptyResponse = isEmptyGeminiResponseError(error);
       const canRetryWithBackoff = isRetryableGeminiStreamError(mapped);
       const canSwitchToFallback =
         canFallback &&
         currentModel !== FALLBACK_AURA_MODEL &&
         (canRetryWithBackoff ||
           mapped.code === "TIMEOUT" ||
-          mapped.code === "MODEL_NOT_FOUND");
+          mapped.code === "MODEL_NOT_FOUND" ||
+          isEmptyResponse);
+      const canRetryEmptyFallback = isEmptyResponse && !canSwitchToFallback;
+      const shouldDelayWithBackoff = canRetryWithBackoff || canRetryEmptyFallback;
+      const willRetry = canSwitchToFallback || shouldDelayWithBackoff;
 
-      if (!canRetryWithBackoff && !canSwitchToFallback) {
+      emitDiagnostic({
+        attempt: attempt + 1,
+        maxAttempts: MAX_STREAM_ATTEMPTS,
+        model: currentModel,
+        mappedCode: mapped.code,
+        httpStatus,
+        errName,
+        emittedAnyChunk,
+        willSwitchToFallback: canSwitchToFallback,
+        willRetry,
+      });
+
+      if (!willRetry) {
         throw error;
       }
 
-      if (canFallback && currentModel !== FALLBACK_AURA_MODEL) {
+      if (canSwitchToFallback) {
         currentModel = FALLBACK_AURA_MODEL;
       }
 
-      if (canRetryWithBackoff) {
+      if (shouldDelayWithBackoff) {
         const delayMs = computeRetryDelayMs(retryCount, {
           baseDelayMs: params.retryBaseDelayMs,
           maxDelayMs: params.retryMaxDelayMs,

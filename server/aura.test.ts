@@ -10,16 +10,19 @@ import {
 } from "./safety";
 import {
   AuraAbortError,
+  AuraEmptyResponseError,
   buildAuraSystemInstruction,
   buildGeminiContents,
   computeRetryDelayMs,
   DEFAULT_AURA_MODEL,
   FALLBACK_AURA_MODEL,
   generateAuraReplyStream,
+  isEmptyGeminiResponseError,
   mapGeminiError,
   MAX_STREAM_ATTEMPTS,
   RETRY_BASE_DELAY_MS,
   RETRY_MAX_DELAY_MS,
+  type StreamAttemptDiagnostic,
   waitWithAbort,
 } from "./auraAgent";
 import { runStructuredReasoning } from "../src/reasoning/reasoningEngine";
@@ -300,7 +303,9 @@ test("exponential backoff with jitter respects bounds and stops after MAX_STREAM
               throw Object.assign(new Error("429 RESOURCE_EXHAUSTED"), { status: 429 });
             }) as never,
           },
-        },
+        } as unknown as NonNullable<
+          Parameters<typeof generateAuraReplyStream>[0]["clientOverride"]
+        >,
       }),
     (err: unknown) => {
       const mapped = mapGeminiError(err);
@@ -354,7 +359,9 @@ test("waitWithAbort and retry waits abort immediately via AbortSignal without re
               throw Object.assign(new Error("RESOURCE_EXHAUSTED"), { status: 429 });
             }) as never,
           },
-        },
+        } as unknown as NonNullable<
+          Parameters<typeof generateAuraReplyStream>[0]["clientOverride"]
+        >,
       }),
     (err: unknown) => err instanceof Error && err.name === "AbortError"
   );
@@ -389,7 +396,9 @@ test("generateAuraReplyStream does not retry after emitting first chunk or on IN
               return partialStream();
             }) as never,
           },
-        },
+        } as unknown as NonNullable<
+          Parameters<typeof generateAuraReplyStream>[0]["clientOverride"]
+        >,
       }),
     (err: unknown) => mapGeminiError(err).code === "RATE_LIMIT"
   );
@@ -416,7 +425,9 @@ test("generateAuraReplyStream does not retry after emitting first chunk or on IN
               throw Object.assign(new Error("API_KEY_INVALID"), { status: 401 });
             }) as never,
           },
-        },
+        } as unknown as NonNullable<
+          Parameters<typeof generateAuraReplyStream>[0]["clientOverride"]
+        >,
       }),
     (err: unknown) => mapGeminiError(err).code === "INVALID_API_KEY"
   );
@@ -498,5 +509,327 @@ test("SSE client propagates status 429 for RATE_LIMIT, preserves explicit status
     globalThis.fetch = originalFetch;
   }
 });
+
+test("empty primary stream switches immediately to FALLBACK_AURA_MODEL without waiting for backoff", async () => {
+  const calledModels: string[] = [];
+  const recordedDelays: number[] = [];
+  const diagnostics: StreamAttemptDiagnostic[] = [];
+
+  const result = await generateAuraReplyStream({
+    apiKey: "test-key-empty-primary",
+    message: "Mi sento stanco oggi",
+    primaryModelOverride: DEFAULT_AURA_MODEL,
+    retryBaseDelayMs: 500,
+    retryMaxDelayMs: 1_000,
+    sleepFn: async (ms) => {
+      recordedDelays.push(ms);
+    },
+    onAttemptDiagnostic: (diag) => {
+      diagnostics.push(diag);
+    },
+    clientOverride: {
+      models: {
+        generateContentStream: async (req: { model: string }) => {
+          calledModels.push(req.model);
+          if (req.model === DEFAULT_AURA_MODEL) {
+            async function* emptyStream() {
+              yield { text: "" };
+            }
+            return emptyStream();
+          }
+          async function* fallbackStream() {
+            yield { text: "Risposta valida dal modello di fallback." };
+          }
+          return fallbackStream();
+        },
+      },
+    } as unknown as NonNullable<Parameters<typeof generateAuraReplyStream>[0]["clientOverride"]>,
+  });
+
+  assert.equal(result.model, FALLBACK_AURA_MODEL);
+  assert.equal(result.reply, "Risposta valida dal modello di fallback.");
+  assert.deepEqual(calledModels, [DEFAULT_AURA_MODEL, FALLBACK_AURA_MODEL]);
+  assert.equal(recordedDelays.length, 0);
+  assert.equal(diagnostics.length, 1);
+  assert.deepEqual(diagnostics[0], {
+    attempt: 1,
+    maxAttempts: MAX_STREAM_ATTEMPTS,
+    model: DEFAULT_AURA_MODEL,
+    mappedCode: "UPSTREAM_ERROR",
+    httpStatus: null,
+    errName: "AuraEmptyResponseError",
+    emittedAnyChunk: false,
+    willSwitchToFallback: true,
+    willRetry: true,
+  });
+});
+
+test("empty fallback stream uses remaining attempts up to MAX_STREAM_ATTEMPTS and succeeds or fails as UPSTREAM_ERROR 502", async () => {
+  const recoveryModels: string[] = [];
+  const recoveryDelays: number[] = [];
+
+  const recovered = await generateAuraReplyStream({
+    apiKey: "test-key-recovery",
+    message: "Aiutami a fare una pausa",
+    primaryModelOverride: DEFAULT_AURA_MODEL,
+    retryBaseDelayMs: 100,
+    retryMaxDelayMs: 400,
+    randomFn: () => 0,
+    sleepFn: async (ms) => {
+      recoveryDelays.push(ms);
+    },
+    clientOverride: {
+      models: {
+        generateContentStream: async (req: { model: string }) => {
+          recoveryModels.push(req.model);
+          if (recoveryModels.length <= 2) {
+            async function* emptyStream() {
+              // Zero chunk utili
+            }
+            return emptyStream();
+          }
+          async function* thirdAttemptOk() {
+            yield { text: "Terzo tentativo riuscito." };
+          }
+          return thirdAttemptOk();
+        },
+      },
+    } as unknown as NonNullable<Parameters<typeof generateAuraReplyStream>[0]["clientOverride"]>,
+  });
+
+  assert.equal(recovered.model, FALLBACK_AURA_MODEL);
+  assert.equal(recovered.reply, "Terzo tentativo riuscito.");
+  assert.deepEqual(recoveryModels, [
+    DEFAULT_AURA_MODEL,
+    FALLBACK_AURA_MODEL,
+    FALLBACK_AURA_MODEL,
+  ]);
+  assert.deepEqual(recoveryDelays, [100]);
+
+  const exhaustedModels: string[] = [];
+  const exhaustedDelays: number[] = [];
+  const exhaustedDiagnostics: StreamAttemptDiagnostic[] = [];
+
+  await assert.rejects(
+    async () =>
+      generateAuraReplyStream({
+        apiKey: "test-key-exhausted",
+        message: "Messaggio di prova esaurimento",
+        primaryModelOverride: DEFAULT_AURA_MODEL,
+        retryBaseDelayMs: 80,
+        retryMaxDelayMs: 300,
+        randomFn: () => 0.5,
+        sleepFn: async (ms) => {
+          exhaustedDelays.push(ms);
+        },
+        onAttemptDiagnostic: (diag) => {
+          exhaustedDiagnostics.push(diag);
+        },
+        clientOverride: {
+          models: {
+            generateContentStream: async (req: { model: string }) => {
+              exhaustedModels.push(req.model);
+              async function* alwaysEmpty() {
+                // Nessun testo emesso
+              }
+              return alwaysEmpty();
+            },
+          },
+        } as unknown as NonNullable<Parameters<typeof generateAuraReplyStream>[0]["clientOverride"]>,
+      }),
+    (err: unknown) => {
+      assert.ok(err instanceof AuraEmptyResponseError);
+      assert.equal(isEmptyGeminiResponseError(err), true);
+      assert.equal(err.message, "Empty response from Gemini model");
+      const mapped = mapGeminiError(err);
+      assert.equal(mapped.code, "UPSTREAM_ERROR");
+      assert.equal(mapped.status, 502);
+      return true;
+    }
+  );
+
+  assert.equal(exhaustedModels.length, MAX_STREAM_ATTEMPTS);
+  assert.deepEqual(exhaustedModels, [
+    DEFAULT_AURA_MODEL,
+    FALLBACK_AURA_MODEL,
+    FALLBACK_AURA_MODEL,
+  ]);
+  assert.equal(exhaustedDelays.length, 1);
+  assert.equal(exhaustedDiagnostics.length, MAX_STREAM_ATTEMPTS);
+  assert.equal(exhaustedDiagnostics[0].willSwitchToFallback, true);
+  assert.equal(exhaustedDiagnostics[0].willRetry, true);
+  assert.equal(exhaustedDiagnostics[1].willSwitchToFallback, false);
+  assert.equal(exhaustedDiagnostics[1].willRetry, true);
+  assert.equal(exhaustedDiagnostics[2].willSwitchToFallback, false);
+  assert.equal(exhaustedDiagnostics[2].willRetry, false);
+});
+
+test("generateAuraReplyStream never retries after emitting first chunk even on transient 503 UPSTREAM_ERROR", async () => {
+  const calledModels: string[] = [];
+  const diagnostics: StreamAttemptDiagnostic[] = [];
+  let sleepCalls = 0;
+
+  await assert.rejects(
+    async () =>
+      generateAuraReplyStream({
+        apiKey: "test-key-post-chunk",
+        message: "Raccontami un esercizio breve",
+        primaryModelOverride: DEFAULT_AURA_MODEL,
+        sleepFn: async () => {
+          sleepCalls += 1;
+        },
+        onChunk: () => {},
+        onAttemptDiagnostic: (diag) => {
+          diagnostics.push(diag);
+        },
+        clientOverride: {
+          models: {
+            generateContentStream: async (req: { model: string }) => {
+              calledModels.push(req.model);
+              async function* partial503Stream() {
+                yield { text: "Inizio risposta" };
+                throw Object.assign(new Error("503 UNAVAILABLE"), { status: 503 });
+              }
+              return partial503Stream();
+            },
+          },
+        } as unknown as NonNullable<Parameters<typeof generateAuraReplyStream>[0]["clientOverride"]>,
+      }),
+    (err: unknown) => {
+      const mapped = mapGeminiError(err);
+      assert.equal(mapped.code, "UPSTREAM_ERROR");
+      assert.equal(mapped.status, 502);
+      return true;
+    }
+  );
+
+  assert.deepEqual(calledModels, [DEFAULT_AURA_MODEL]);
+  assert.equal(sleepCalls, 0);
+  assert.equal(diagnostics.length, 1);
+  assert.deepEqual(diagnostics[0], {
+    attempt: 1,
+    maxAttempts: MAX_STREAM_ATTEMPTS,
+    model: DEFAULT_AURA_MODEL,
+    mappedCode: "UPSTREAM_ERROR",
+    httpStatus: 503,
+    errName: "Error",
+    emittedAnyChunk: true,
+    willSwitchToFallback: false,
+    willRetry: false,
+  });
+});
+
+test("per-attempt diagnostic logs exclude apiKey, user message, history, context, and system prompt", async () => {
+  const secretApiKey = "AIzaSySecretKeyNeverLog123456";
+  const secretUserMessage = "Messaggio privato sensibile utente xyz987";
+  const secretHistoryText = "Cronologia riservata precedente abc654";
+  const secretMoodContext = "UmoreConfidenzialeSegreto";
+
+  const capturedWarnArgs: unknown[][] = [];
+  const originalWarn = console.warn;
+  console.warn = (...args: unknown[]) => {
+    capturedWarnArgs.push(args);
+  };
+
+  try {
+    await generateAuraReplyStream({
+      apiKey: secretApiKey,
+      message: secretUserMessage,
+      history: [{ role: "user", text: secretHistoryText }],
+      context: {
+        mood: secretMoodContext,
+        stress: 7,
+        orchestratedContextSummary: "CONTESTO_RISERVATO_NON_LOGGARE",
+      },
+      primaryModelOverride: DEFAULT_AURA_MODEL,
+      retryBaseDelayMs: 10,
+      retryMaxDelayMs: 20,
+      sleepFn: async () => {},
+      clientOverride: {
+        models: {
+          generateContentStream: async (req: { model: string }) => {
+            if (req.model === DEFAULT_AURA_MODEL) {
+              throw Object.assign(new Error("503 Service Unavailable"), { status: 503 });
+            }
+            async function* okFallback() {
+              yield { text: "Risposta privata ok" };
+            }
+            return okFallback();
+          },
+        },
+      } as unknown as NonNullable<Parameters<typeof generateAuraReplyStream>[0]["clientOverride"]>,
+    });
+  } finally {
+    console.warn = originalWarn;
+  }
+
+  assert.equal(capturedWarnArgs.length, 1);
+  const serialized = JSON.stringify(capturedWarnArgs[0]);
+  assert.equal(serialized.includes(secretApiKey), false);
+  assert.equal(serialized.includes(secretUserMessage), false);
+  assert.equal(serialized.includes(secretHistoryText), false);
+  assert.equal(serialized.includes(secretMoodContext), false);
+  assert.equal(serialized.includes("CONTESTO_RISERVATO_NON_LOGGARE"), false);
+  assert.equal(serialized.includes("Risposta privata ok"), false);
+  assert.equal(serialized.includes("Sei AURA"), false);
+
+  const diagPayload = capturedWarnArgs[0][1] as StreamAttemptDiagnostic;
+  assert.deepEqual(diagPayload, {
+    attempt: 1,
+    maxAttempts: MAX_STREAM_ATTEMPTS,
+    model: DEFAULT_AURA_MODEL,
+    mappedCode: "UPSTREAM_ERROR",
+    httpStatus: 503,
+    errName: "Error",
+    emittedAnyChunk: false,
+    willSwitchToFallback: true,
+    willRetry: true,
+  });
+});
+
+test("abort during empty-fallback backoff cancels immediately without executing extra attempts", async () => {
+  const controller = new AbortController();
+  const calledModels: string[] = [];
+  const diagnostics: StreamAttemptDiagnostic[] = [];
+  const startedAt = Date.now();
+
+  await assert.rejects(
+    async () =>
+      generateAuraReplyStream({
+        apiKey: "test-key-abort-empty",
+        message: "Test interruzione dopo fallback vuoto",
+        signal: controller.signal,
+        primaryModelOverride: DEFAULT_AURA_MODEL,
+        retryBaseDelayMs: 5_000,
+        retryMaxDelayMs: 5_000,
+        onAttemptDiagnostic: (diag) => {
+          diagnostics.push(diag);
+        },
+        clientOverride: {
+          models: {
+            generateContentStream: async (req: { model: string }) => {
+              calledModels.push(req.model);
+              if (req.model === FALLBACK_AURA_MODEL) {
+                setTimeout(() => controller.abort(), 15);
+              }
+              async function* emptyStream() {
+                // Stream vuoto
+              }
+              return emptyStream();
+            },
+          },
+        } as unknown as NonNullable<Parameters<typeof generateAuraReplyStream>[0]["clientOverride"]>,
+      }),
+    (err: unknown) => err instanceof Error && err.name === "AbortError"
+  );
+
+  const elapsed = Date.now() - startedAt;
+  assert.deepEqual(calledModels, [DEFAULT_AURA_MODEL, FALLBACK_AURA_MODEL]);
+  assert.ok(elapsed < 500, `Expected immediate abort under 500ms, got ${elapsed}ms`);
+  assert.equal(diagnostics.length, 2);
+  assert.equal(diagnostics[0].willSwitchToFallback, true);
+  assert.equal(diagnostics[1].model, FALLBACK_AURA_MODEL);
+});
+
 
 
